@@ -1,0 +1,22 @@
+O objetivo deste exercício é aplicar os conceitos básicos de Python abordados na revisão, incluindo variáveis, tipos de dados, estruturas de controle e funções.
+
+Descrição do Problema
+
+Desenvolva um programa básico em Python que rode no terminal e permita realizar um CRUD (Create, Read, Update, Delete) de alunos em uma faculdade.
+
+Cada aluno deve possuir os seguintes atributos:
+
+Nome
+Email
+Curso (GES, GEC, GET, GEP, etc.)
+Matrícula (gerada automaticamente com base no curso)
+A matrícula deve ser composta pelo nome do curso (ou uma abreviação) seguido de um número sequencial. Exemplo:
+Aluno cadastrado no curso de Engenharia de Software - GES pode ter a matrícula GES1, GES2, etc.
+Requisitos
+
+Funções
+O programa deve ser modularizado, com cada funcionalidade implementada em uma função separada.
+Estrutura de Dados
+O programa deve usar uma lista ou um dicionário para armazenar as informações dos alunos.
+Interação com o Usuário:
+O programa deve interagir com o usuário através de um menu no terminal, permitindo que ele escolha entre as opções disponíveis.
