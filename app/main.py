@@ -1,14 +1,42 @@
-from typing import Optional
+import os
+from contextlib import asynccontextmanager
+from typing import Annotated, Optional
 
-from fastapi import FastAPI, HTTPException, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Response, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from sqlalchemy import Integer, String, create_engine, delete, func, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 CURSOS = ["GES", "GEC"]
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+psycopg://postgres:postgres@localhost:5432/alunos",
+)
 
-app = FastAPI(title="CRUD de Alunos", version="1.0.0")
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
-alunos: dict[str, dict] = {}
-contador_matriculas = {curso: 0 for curso in CURSOS}
+
+class Base(DeclarativeBase):
+    pass
+
+
+class AlunoModel(Base):
+    __tablename__ = "alunos"
+
+    db_id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    id: Mapped[str] = mapped_column(String(10), unique=True, index=True)
+    nome: Mapped[str] = mapped_column(String(120))
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    curso: Mapped[str] = mapped_column(String(10), index=True)
+    matricula: Mapped[int] = mapped_column(Integer)
+
+
+class ContadorCursoModel(Base):
+    __tablename__ = "contadores_cursos"
+
+    curso: Mapped[str] = mapped_column(String(10), primary_key=True)
+    proxima_matricula: Mapped[int] = mapped_column(Integer, default=1)
 
 
 class AlunoBase(BaseModel):
@@ -38,10 +66,42 @@ class AlunoResponse(AlunoBase):
     model_config = ConfigDict(from_attributes=True)
 
 
-def reset_state():
-    alunos.clear()
+def criar_tabelas():
+    Base.metadata.create_all(bind=engine)
+    with SessionLocal() as db:
+        inicializar_contadores(db)
+        db.commit()
+
+
+def inicializar_contadores(db: Session):
     for curso in CURSOS:
-        contador_matriculas[curso] = 0
+        contador = db.get(ContadorCursoModel, curso)
+        if contador is None:
+            db.add(ContadorCursoModel(curso=curso, proxima_matricula=1))
+
+
+def reset_state():
+    criar_tabelas()
+    with SessionLocal() as db:
+        db.execute(delete(AlunoModel))
+        for curso in CURSOS:
+            contador = db.get(ContadorCursoModel, curso)
+            if contador is None:
+                db.add(ContadorCursoModel(curso=curso, proxima_matricula=1))
+            else:
+                contador.proxima_matricula = 1
+        db.commit()
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+DBSession = Annotated[Session, Depends(get_db)]
 
 
 def validar_curso(curso: str) -> str:
@@ -54,14 +114,46 @@ def validar_curso(curso: str) -> str:
     return curso_normalizado
 
 
-def cria_matricula(curso: str) -> tuple[int, str]:
-    contador_matriculas[curso] += 1
-    matricula = contador_matriculas[curso]
+def cria_matricula(db: Session, curso: str) -> tuple[int, str]:
+    contador = db.get(ContadorCursoModel, curso)
+    if contador is None:
+        contador = ContadorCursoModel(curso=curso, proxima_matricula=1)
+        db.add(contador)
+        db.flush()
+
+    matricula = contador.proxima_matricula
+    contador.proxima_matricula += 1
     return matricula, f"{curso}{matricula}"
 
 
-def serializar_aluno(aluno: dict) -> AlunoResponse:
-    return AlunoResponse(**aluno)
+def buscar_modelo_por_id(db: Session, aluno_id: str) -> AlunoModel:
+    aluno = db.scalar(select(AlunoModel).where(AlunoModel.id == aluno_id.upper()))
+    if aluno is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Aluno nao encontrado.",
+        )
+    return aluno
+
+
+def salvar_aluno(db: Session, aluno: AlunoModel) -> AlunoModel:
+    db.add(aluno)
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(aluno)
+    return aluno
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    criar_tabelas()
+    yield
+
+
+app = FastAPI(title="CRUD de Alunos", version="1.0.0", lifespan=lifespan)
 
 
 @app.get("/")
@@ -70,19 +162,14 @@ def read_root():
 
 
 @app.get("/api/v1/alunos", response_model=list[AlunoResponse])
-def listar_alunos():
-    return [serializar_aluno(aluno) for aluno in alunos.values()]
+def listar_alunos(db: DBSession):
+    alunos = db.scalars(select(AlunoModel).order_by(AlunoModel.db_id)).all()
+    return alunos
 
 
 @app.get("/api/v1/alunos/{aluno_id}", response_model=AlunoResponse)
-def buscar_aluno(aluno_id: str):
-    aluno = alunos.get(aluno_id.upper())
-    if aluno is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Aluno nao encontrado.",
-        )
-    return serializar_aluno(aluno)
+def buscar_aluno(aluno_id: str, db: DBSession):
+    return buscar_modelo_por_id(db, aluno_id)
 
 
 @app.post(
@@ -90,92 +177,58 @@ def buscar_aluno(aluno_id: str):
     response_model=AlunoResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def cadastrar_aluno(payload: AlunoCreate):
+def cadastrar_aluno(payload: AlunoCreate, db: DBSession):
     curso = validar_curso(payload.curso)
-    matricula, aluno_id = cria_matricula(curso)
+    matricula, aluno_id = cria_matricula(db, curso)
 
-    aluno = {
-        "nome": payload.nome.strip(),
-        "email": payload.email,
-        "curso": curso,
-        "matricula": matricula,
-        "id": aluno_id,
-    }
-    alunos[aluno_id] = aluno
-    return serializar_aluno(aluno)
+    aluno = AlunoModel(
+        nome=payload.nome.strip(),
+        email=str(payload.email),
+        curso=curso,
+        matricula=matricula,
+        id=aluno_id,
+    )
+    return salvar_aluno(db, aluno)
 
 
 @app.put("/api/v1/alunos/{aluno_id}", response_model=AlunoResponse)
-def atualizar_aluno(aluno_id: str, payload: AlunoUpdate):
-    id_atual = aluno_id.upper()
-    aluno_existente = alunos.get(id_atual)
-    if aluno_existente is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Aluno nao encontrado.",
-        )
-
+def atualizar_aluno(aluno_id: str, payload: AlunoUpdate, db: DBSession):
+    aluno = buscar_modelo_por_id(db, aluno_id)
     curso = validar_curso(payload.curso)
-    nova_matricula = aluno_existente["matricula"]
-    novo_id = id_atual
 
-    if curso != aluno_existente["curso"]:
-        nova_matricula, novo_id = cria_matricula(curso)
-        del alunos[id_atual]
+    if curso != aluno.curso:
+        aluno.matricula, aluno.id = cria_matricula(db, curso)
 
-    aluno_atualizado = {
-        "nome": payload.nome.strip(),
-        "email": payload.email,
-        "curso": curso,
-        "matricula": nova_matricula,
-        "id": novo_id,
-    }
-    alunos[novo_id] = aluno_atualizado
-    return serializar_aluno(aluno_atualizado)
+    aluno.nome = payload.nome.strip()
+    aluno.email = str(payload.email)
+    aluno.curso = curso
+    return salvar_aluno(db, aluno)
 
 
 @app.patch("/api/v1/alunos/{aluno_id}", response_model=AlunoResponse)
-def atualizar_parcialmente_aluno(aluno_id: str, payload: AlunoPatch):
-    id_atual = aluno_id.upper()
-    aluno_existente = alunos.get(id_atual)
-    if aluno_existente is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Aluno nao encontrado.",
-        )
-
+def atualizar_parcialmente_aluno(aluno_id: str, payload: AlunoPatch, db: DBSession):
+    aluno = buscar_modelo_por_id(db, aluno_id)
     dados = payload.model_dump(exclude_unset=True)
-    curso = aluno_existente["curso"]
-    nova_matricula = aluno_existente["matricula"]
-    novo_id = id_atual
 
     if "curso" in dados:
         curso = validar_curso(dados["curso"])
-        if curso != aluno_existente["curso"]:
-            nova_matricula, novo_id = cria_matricula(curso)
-            del alunos[id_atual]
+        if curso != aluno.curso:
+            aluno.matricula, aluno.id = cria_matricula(db, curso)
+        aluno.curso = curso
 
-    aluno_atualizado = {
-        "nome": dados.get("nome", aluno_existente["nome"]).strip(),
-        "email": dados.get("email", aluno_existente["email"]),
-        "curso": curso,
-        "matricula": nova_matricula,
-        "id": novo_id,
-    }
-    alunos[novo_id] = aluno_atualizado
-    return serializar_aluno(aluno_atualizado)
+    if "nome" in dados:
+        aluno.nome = dados["nome"].strip()
+    if "email" in dados:
+        aluno.email = str(dados["email"])
+
+    return salvar_aluno(db, aluno)
 
 
 @app.delete("/api/v1/alunos/{aluno_id}", status_code=status.HTTP_204_NO_CONTENT)
-def excluir_aluno(aluno_id: str):
-    id_atual = aluno_id.upper()
-    if id_atual not in alunos:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Aluno nao encontrado.",
-        )
-
-    del alunos[id_atual]
+def excluir_aluno(aluno_id: str, db: DBSession):
+    aluno = buscar_modelo_por_id(db, aluno_id)
+    db.delete(aluno)
+    db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -183,3 +236,8 @@ def excluir_aluno(aluno_id: str):
 def resetar_alunos():
     reset_state()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+def total_alunos_persistidos() -> int:
+    with SessionLocal() as db:
+        return db.scalar(select(func.count()).select_from(AlunoModel)) or 0

@@ -1,7 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app, reset_state
+from app.main import app, reset_state, total_alunos_persistidos
 
 URL_BASE = "/api/v1/alunos"
 
@@ -71,6 +71,16 @@ class TestesCrudAlunos:
 
         assert resposta.status_code == 200
         assert resposta.json() == alunos
+
+    def test_deve_persistir_alunos_no_banco_entre_clientes(self, cliente):
+        alunos = criar_tres_alunos_por_curso(cliente)
+
+        with TestClient(app) as novo_cliente:
+            resposta = novo_cliente.get(URL_BASE)
+
+        assert resposta.status_code == 200
+        assert resposta.json() == alunos
+        assert total_alunos_persistidos() == 6
 
     def test_deve_buscar_aluno_por_id(self, cliente):
         aluno = criar_aluno(
